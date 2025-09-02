@@ -9,6 +9,7 @@ import requests
 import base64
 from io import BytesIO
 from PIL import Image, UnidentifiedImageError
+import random
 
 # ----------------- CONFIG -----------------
 DB_FILE = "auction.db"
@@ -16,7 +17,7 @@ PLACEHOLDER = "assets/placeholder.png"
 BELL = "assets/bell.mp3"
 
 st.set_page_config(page_title="🏏 Cricket Auction App (DB)", layout="wide")
-st.sidebar.markdown("[🌐 GitHub](https://github.com/deveshc20)  |  🧑‍💻 Created by **DC**")
+
 
 # ----------------- DATABASE HELPERS -----------------
 def init_db():
@@ -281,12 +282,14 @@ def play_sound():
 
 # ----------------- APP INIT -----------------
 init_db()
+if "auctioned_ids" not in st.session_state:
+    st.session_state.auctioned_ids = set()
 
 with st.sidebar:
     if st.button("🗑️ Reset Auction Summary"):
-        # Only clear auction results and summary session state, do NOT touch teams or players
-        clear_results()  # clears results table (affects results and unsold players in summary)
-        reset_summary_session()  # clears auction_results, current_player, start_time in session state
+        clear_results()
+        reset_summary_session()
+        st.session_state.auctioned_ids.clear()  # 🔹 FIX: reset tracker too
         st.success("✅ Auction results and unsold players cleared from summary! Team details remain unchanged.")
         st.rerun()
 
@@ -300,16 +303,25 @@ if "db_loaded" not in st.session_state:
     st.session_state.start_time = None
     st.session_state.db_loaded = True
 
-if "db_loaded" not in st.session_state:
-    st.session_state.players_df = load_players_df_from_db()
-    st.session_state.teams = load_teams_from_db()
-    st.session_state.auction_results = (
-        load_results_from_db().to_dict(orient="records")
-        if not load_results_from_db().empty else []
-    )
-    st.session_state.current_player = None
-    st.session_state.start_time = None
-    st.session_state.db_loaded = True
+# ----------------- FIX: Unique random player picker -----------------
+def pick_unique_random_player():
+    """Pick a random unauctioned player not seen before."""
+    fresh_players = load_players_df_from_db()
+    unauctioned_df = fresh_players[fresh_players['auctioned'] == 0]
+
+    # ✅ FIX: Only filter by auctioned flag, not session tracker if DB is fresh
+    if unauctioned_df.empty:
+        return None
+
+    # Exclude players already chosen in this session (extra safeguard)
+    unauctioned_df = unauctioned_df[~unauctioned_df['player_id'].isin(st.session_state.auctioned_ids)]
+
+    if unauctioned_df.empty:
+        return None
+
+    picked = unauctioned_df.sample(1).iloc[0].to_dict()
+    st.session_state.auctioned_ids.add(picked['player_id'])  # track this ID
+    return picked
 
 # ----------------- UI: Tabs -----------------
 tabs = st.tabs(["📅 Upload Players", "👥 Team Setup", "🎯 Auction Panel", "📊 Summary & Export"])
@@ -438,7 +450,7 @@ with tabs[2]:
                 teams_list = [t['Team'] for t in st.session_state.teams] if st.session_state.teams else []
                 bid_col1, bid_col2 = st.columns([2, 1])
                 with bid_col1:
-                    selected_team = st.selectbox("🏷️ Select Team", ["UNSOLD"] + teams_list)
+                    selected_team = st.selectbox("🏷️ Select Team", ["Select Team"] + teams_list)
                     sold_price = st.number_input("💰 Sold Price (₹)", min_value=0, step=5, value=20)
                 with bid_col2:
                     sold_btn = st.button("✅ Mark as Sold", key="sold_btn")
@@ -467,17 +479,32 @@ with tabs[2]:
 
 
         # Pick random player button
+        # 🔹 FIX: Use unique random picker instead of raw sample
         st.markdown("---")
-        if st.button("🎲 Pick Random Player"):
-            if unauctioned_df.empty:
+        pick_disabled = st.session_state.current_player is not None  # disable if player active
+        if st.button("🎲 Pick Random Player", disabled=pick_disabled):
+            picked = pick_unique_random_player()
+            if picked is None:
                 st.info("✅ All players have been auctioned.")
             else:
-                # pick one and store in session
-                picked = unauctioned_df.sample(1).iloc[0].to_dict()
                 st.session_state.current_player = picked
                 st.session_state.start_time = time.time()
                 st.rerun()
+        # 🔹 FIX: Ensure Sold/Unsold clears current player
+        if st.session_state.current_player is not None:
+            player_id = st.session_state.current_player["player_id"]
 
+
+            if st.button("✅ Sold"):
+                add_result_to_db(player_id, team, price, status="Sold")
+                st.session_state.current_player = None
+                st.rerun()
+
+
+            if st.button("❌ Unsold"):
+                add_result_to_db(player_id, None, 0, status="Unsold")
+                st.session_state.current_player = None
+                st.rerun() 
 
 # 4️⃣ Summary & Export
 with tabs[3]:

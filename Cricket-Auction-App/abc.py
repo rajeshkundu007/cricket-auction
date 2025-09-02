@@ -1,0 +1,526 @@
+# auction_app.py
+import streamlit as st
+import pandas as pd
+import sqlite3
+import os
+import time
+import re
+import requests
+import base64
+from io import BytesIO
+from PIL import Image, UnidentifiedImageError
+
+# ----------------- CONFIG -----------------
+DB_FILE = "auction.db"
+PLACEHOLDER = "assets/placeholder.png"
+BELL = "assets/bell.mp3"
+
+st.set_page_config(page_title="🏏 Cricket Auction App (DB)", layout="wide")
+st.sidebar.markdown("[🌐 GitHub](https://github.com/deveshc20)  |  🧑‍💻 Created by **DC**")
+
+# ----------------- DATABASE HELPERS -----------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # players table: store raw columns from Excel + auctioned flag
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            player_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            department TEXT,
+            year TEXT,
+            role TEXT,
+            photo TEXT,
+            auctioned INTEGER DEFAULT 0
+        )
+    """)
+    # teams table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS teams (
+            team TEXT PRIMARY KEY,
+            budget INTEGER,
+            initial_budget INTEGER,
+            spent INTEGER DEFAULT 0
+        )
+    """)
+    # results table (history)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER,
+            full_name TEXT,
+            team TEXT,
+            price INTEGER,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_players_df_to_db(df: pd.DataFrame):
+    """
+    Save players dataframe into the DB.
+    Expects df columns: FULL NAME, DEPARTMENT, YEAR, PLAYER ROLE, UPLOAD YOUR PHOTO
+    Will map them into players table and set player_id starting at 1.
+    """
+    # normalize columns
+    df = df.rename(columns={
+        'FULL NAME': 'full_name',
+        'DEPARTMENT': 'department',
+        'YEAR': 'year',
+        'PLAYER ROLE': 'role',
+        'UPLOAD YOUR PHOTO': 'photo'
+    })
+    df = df[['full_name', 'department', 'year', 'role', 'photo']].copy()
+    df.reset_index(drop=True, inplace=True)
+    df['player_id'] = df.index + 1
+    df['auctioned'] = 0
+
+    conn = sqlite3.connect(DB_FILE)
+    # replace players table with new data
+    df[['player_id', 'full_name', 'department', 'year', 'role', 'photo', 'auctioned']].to_sql(
+        "players", conn, if_exists="replace", index=False
+    )
+    conn.commit()
+    conn.close()
+
+def load_players_df_from_db() -> pd.DataFrame:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        df = pd.read_sql("SELECT * FROM players ORDER BY player_id", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+def save_teams_to_db(teams: list):
+    """
+    teams: list of dicts with keys: 'Team' (name), 'Budget' (current), 'InitialBudget', 'Spent'
+    We'll store 'team', 'budget', 'initial_budget', 'spent' columns.
+    """
+    df = pd.DataFrame([{
+        'team': t['Team'],
+        'budget': int(t.get('Budget', 0)),
+        'initial_budget': int(t.get('InitialBudget', t.get('Budget', 0))),
+        'spent': int(t.get('Spent', 0))
+    } for t in teams])
+    conn = sqlite3.connect(DB_FILE)
+    df.to_sql("teams", conn, if_exists="replace", index=False)
+    conn.commit()
+    conn.close()
+
+def load_teams_from_db() -> list:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        df = pd.read_sql("SELECT * FROM teams", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    if df.empty:
+        return []
+    out = []
+    for _, row in df.iterrows():
+        out.append({
+            'Team': row['team'],
+            'Budget': int(row['budget']),
+            'InitialBudget': int(row['initial_budget']),
+            'Spent': int(row['spent']),
+            'Players': []  # we'll fill players list on demand from results
+        })
+    return out
+
+def add_result_to_db(player_id:int, full_name:str, team:str, price:int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO results (player_id, full_name, team, price) VALUES (?, ?, ?, ?)",
+              (player_id, full_name, team, price))
+    # mark player auctioned
+    c.execute("UPDATE players SET auctioned = 1 WHERE player_id = ?", (player_id,))
+    # if team not UNSOLD, update team's spent and budget
+    if team != "UNSOLD":
+        c.execute("UPDATE teams SET spent = spent + ?, budget = budget - ? WHERE team = ?",
+                  (price, price, team))
+    conn.commit()
+    conn.close()
+
+# ----------------- EXTRA RESET FUNCTIONS -----------------
+def clear_results():
+    """Delete only results table (auction summary)."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM results")
+    conn.commit()
+    conn.close()
+
+def reset_summary_session():
+    """Clear only summary-related session state values."""
+    if "auction_results" in st.session_state:
+        st.session_state.auction_results = []
+    if "current_player" in st.session_state:
+        st.session_state.current_player = None
+    if "start_time" in st.session_state:
+        st.session_state.start_time = None
+
+def load_results_from_db():
+    """Load auction results as a DataFrame."""
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql("SELECT * FROM results", conn)
+    conn.close()
+    return df
+
+
+def export_results_to_excel(results_df: pd.DataFrame, teams: list, filename="auction_results.xlsx"):
+    # results_df is a dataframe of results
+    with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+        if not results_df.empty:
+            results_df.to_excel(writer, index=False, sheet_name="Results")
+        # team sheets
+        for t in teams:
+            team_name = t['Team'][:31] if t['Team'] else "Team"
+            # fetch players for this team from results
+            team_res = results_df[results_df['team'] == t['Team']]
+            if team_res.empty:
+                continue
+            # We want cols: player_id, full_name, maybe price
+            team_res[['player_id', 'full_name', 'price']].rename(
+                columns={'player_id': 'Player ID', 'full_name': 'FULL NAME', 'price': 'Price'}
+            ).to_excel(writer, index=False, sheet_name=team_name)
+
+# ----------------- DRIVE IMAGE HELPERS -----------------
+def extract_drive_file_id(link: str):
+    """Extract Google Drive file id from various link formats or return None."""
+    if not link or pd.isna(link):
+        return None
+    s = str(link).strip()
+
+    # Common patterns: id=..., /d/<id>/, or just the id
+    m = re.search(r'id=([a-zA-Z0-9_\-]+)', s)
+    if m:
+        fid = m.group(1)
+    else:
+        m = re.search(r'/d/([a-zA-Z0-9_\-]+)', s)
+        if m:
+            fid = m.group(1)
+        else:
+            # maybe just pasted the id
+            m = re.fullmatch(r'[a-zA-Z0-9_\-]{8,}', s)
+            if m:
+                fid = s
+            else:
+                return None
+    fid = fid.strip().rstrip(' _.,?&')
+    return fid if fid else None
+
+def make_drive_download_url(fid: str):
+    # export=download tends to return raw bytes
+    return f"https://drive.google.com/uc?export=download&id={fid}"
+
+@st.cache_data(show_spinner=False)
+def download_image_bytes(url: str):
+    """Download bytes for an image URL (cached). Returns bytes or raises."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=12)
+    r.raise_for_status()
+    return r.content, r.headers.get("Content-Type", "")
+
+def show_player_image(photo_link, caption=""):
+    """Robust image display:
+       1) extract file id and try to download bytes and open via PIL (recommended)
+       2) if (1) fails, try st.image with the uc download url (embedding)
+       3) fallback to placeholder
+    """
+    placeholder_exists = os.path.exists(PLACEHOLDER)
+    fid = extract_drive_file_id(photo_link)
+    if fid:
+        url = make_drive_download_url(fid)
+        # try direct download + PIL display
+        try:
+            img_bytes, content_type = download_image_bytes(url)
+            try:
+                img = Image.open(BytesIO(img_bytes))
+                st.image(img, width=400, caption=caption)
+                return
+            except UnidentifiedImageError:
+                # not a valid image
+                pass
+        except Exception:
+            # download failed - maybe Drive requires confirm token for large files or file not available
+            pass
+        # fallback: try embedding the uc url (sometimes works)
+        try:
+            st.image(url, width=200, caption=caption)
+            return
+        except Exception:
+            pass
+
+    # If we reach here, nothing worked -> show placeholder
+    if placeholder_exists:
+        st.image(PLACEHOLDER, width=200, caption=caption)
+    else:
+        st.write("(image not available)")
+        if caption:
+            st.caption(caption)
+
+# ----------------- SOUND -----------------
+def play_sound():
+    if os.path.exists(BELL):
+        try:
+            with open(BELL, "rb") as f:
+                audio_bytes = f.read()
+            st.audio(audio_bytes, format="audio/mp3")
+        except Exception:
+            # fallback to inline base64
+            try:
+                with open(BELL, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                st.markdown(f"""
+                    <audio autoplay>
+                      <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+                    </audio>
+                """, unsafe_allow_html=True)
+            except Exception:
+                pass
+
+# ----------------- APP INIT -----------------
+init_db()
+
+with st.sidebar:
+    if st.button("🗑️ Reset Auction Summary"):
+        clear_results()
+        reset_summary_session()
+        st.success("✅ Auction summary cleared! Teams and players are intact.")
+        st.rerun()
+
+# Load persisted data into session_state on first run
+if "db_loaded" not in st.session_state:
+    # load players and teams into session state for UI convenience
+    st.session_state.players_df = load_players_df_from_db()
+    st.session_state.teams = load_teams_from_db()
+    st.session_state.auction_results = load_results_from_db().to_dict(orient="records") if not load_results_from_db().empty else []
+    st.session_state.current_player = None
+    st.session_state.start_time = None
+    st.session_state.db_loaded = True
+
+if "db_loaded" not in st.session_state:
+    st.session_state.players_df = load_players_df_from_db()
+    st.session_state.teams = load_teams_from_db()
+    st.session_state.auction_results = (
+        load_results_from_db().to_dict(orient="records")
+        if not load_results_from_db().empty else []
+    )
+    st.session_state.current_player = None
+    st.session_state.start_time = None
+    st.session_state.db_loaded = True
+
+# ----------------- UI: Tabs -----------------
+tabs = st.tabs(["📅 Upload Players", "👥 Team Setup", "🎯 Auction Panel", "📊 Summary & Export"])
+
+# 1️⃣ Upload Players
+with tabs[0]:
+    st.title("📅 Upload Player List")
+    uploaded_file = st.file_uploader("Upload Excel file (xlsx)", type=["xlsx"])
+    required_columns = ["FULL NAME", "DEPARTMENT", "YEAR", "PLAYER ROLE", "UPLOAD YOUR PHOTO"]
+
+    if uploaded_file:
+        try:
+            df = pd.read_excel(uploaded_file)
+            df.columns = [str(c).strip() for c in df.columns]  # normalize headers
+            if not all(col in df.columns for col in required_columns):
+                missing = list(set(required_columns) - set(df.columns))
+                st.error(f"Missing columns: {', '.join(missing)}")
+            else:
+                # Save into DB
+                save_players_df_to_db(df)
+                st.session_state.players_df = load_players_df_from_db()
+                st.success("✅ Players uploaded and saved to database.")
+                st.dataframe(st.session_state.players_df.head(20))
+        except Exception as e:
+            st.error(f"Error reading file: {e}")
+    else:
+        if st.session_state.players_df is None or st.session_state.players_df.empty:
+            st.info("Upload an Excel file with columns: FULL NAME, DEPARTMENT, YEAR, PLAYER ROLE, UPLOAD YOUR PHOTO")
+        else:
+            st.info("Players already loaded from DB.")
+            st.dataframe(st.session_state.players_df.head(10))
+
+# 2️⃣ Team Setup
+with tabs[1]:
+    st.title("👥 Team Setup")
+    existing_teams = st.session_state.teams if st.session_state.teams else []
+    num_teams = st.number_input("Number of teams", min_value=2, max_value=12, value=max(2, len(existing_teams) or 4), step=1)
+
+    with st.form("team_setup_form"):
+        st.subheader("Enter Team Details")
+        teams_input = []
+        # if we have existing teams, prefill them
+        for i in range(num_teams):
+            col1, col2 = st.columns([2, 1])
+            default_name = existing_teams[i]['Team'] if i < len(existing_teams) else ""
+            default_budget = existing_teams[i]['Budget'] if i < len(existing_teams) else 1000
+            name = col1.text_input(f"Team {i+1} Name", value=default_name, key=f"team_name_{i}")
+            budget = col2.number_input(f"Budget (₹)", min_value=10, step=10, value=int(default_budget), key=f"budget_{i}")
+            teams_input.append({"Team": name.strip(), "Budget": int(budget), "InitialBudget": int(budget), "Spent": 0, "Players": []})
+        submit = st.form_submit_button("✅ Save Teams")
+
+    if submit:
+        if all(t["Team"] for t in teams_input):
+            st.session_state.teams = teams_input
+            # persist to DB
+            save_teams_to_db(teams_input)
+            st.success("✅ Teams saved successfully!")
+        else:
+            st.error("❌ All team names are required.")
+
+    # display summary
+    if st.session_state.teams:
+        st.subheader("📋 Team Summary")
+        for t in st.session_state.teams:
+            st.markdown(f"### 🏏 {t['Team']}")
+            init = t.get("InitialBudget", t.get("Budget", 1)) or 1
+            progress_val = min(t.get("Spent", 0) / init, 1.0)
+            st.progress(progress_val)
+            st.write(f"💰 Budget Left: ₹{t['Budget']}  |  🛒 Spent: ₹{t['Spent']}")
+
+# 3️⃣ Auction Panel
+with tabs[2]:
+    st.title("🎯 Auction Panel")
+    players_df = load_players_df_from_db()
+    if players_df.empty:
+        st.warning("⚠️ Upload the player list first in the 'Upload Players' tab.")
+    else:
+        unauctioned_df = players_df[players_df['auctioned'] == 0]
+        col_left, col_right = st.columns([1, 2])
+
+        # Show currently selected player if any
+        if st.session_state.current_player:
+            player = st.session_state.current_player
+            with col_left:
+                st.subheader("Player Photo")
+                st.image(
+                player.get("photo"),
+                
+                width=1000)  # ⬅️ Increase/decrease this number as needed)
+                show_player_image(player.get("photo"), caption=player.get("full_name"))
+            with col_right:
+                st.subheader("🔥 Player on Auction")
+                st.markdown(f"<span style='font-size:2rem; font-weight:bold;'>Name: {player.get('full_name')}</span>", unsafe_allow_html=True)
+                st.markdown(f"<span style='font-size:1.5rem;'>Role: {player.get('role')}</span>", unsafe_allow_html=True)
+                st.markdown(f"<span style='font-size:1.5rem;'>Dept: {player.get('department')}</span>", unsafe_allow_html=True)
+                st.markdown(f"<span style='font-size:1.5rem;'>Year: {player.get('year')}</span>", unsafe_allow_html=True)
+                st.markdown("---")
+                teams_list = [t['Team'] for t in st.session_state.teams] if st.session_state.teams else []
+                bid_col1, bid_col2 = st.columns([2, 1])
+                with bid_col1:
+                    selected_team = st.selectbox("🏷️ Select Team", ["UNSOLD"] + teams_list)
+                    sold_price = st.number_input("💰 Sold Price (₹)", min_value=0, step=5, value=20)
+                with bid_col2:
+                    sold_btn = st.button("✅ Mark as Sold", key="sold_btn")
+                    unsold_btn = st.button("❌ Mark as Unsold", key="unsold_btn")
+
+                if sold_btn and sold_price > 0:
+                    # commit to DB
+                    add_result_to_db(int(player['player_id']), player['full_name'], selected_team, int(sold_price))
+                    # update session_state players_df
+                    st.session_state.players_df = load_players_df_from_db()
+                    # update teams in session from DB
+                    st.session_state.teams = load_teams_from_db()
+                    st.session_state.current_player = None
+                    st.session_state.start_time = None
+                    st.success(f"🎉 {player['full_name']} sold to {selected_team} for ₹{sold_price}!")
+                    play_sound()
+                    st.rerun()
+
+                if unsold_btn:
+                    add_result_to_db(int(player['player_id']), player['full_name'], "UNSOLD", 0)
+                    st.session_state.players_df = load_players_df_from_db()
+                    st.session_state.current_player = None
+                    st.session_state.start_time = None
+                    st.info("🚫 Player marked as UNSOLD.")
+                    st.rerun()
+
+
+        # Pick random player button
+        st.markdown("---")
+        if st.button("🎲 Pick Random Player"):
+            if unauctioned_df.empty:
+                st.info("✅ All players have been auctioned.")
+            else:
+                # pick one and store in session
+                picked = unauctioned_df.sample(1).iloc[0].to_dict()
+                st.session_state.current_player = picked
+                st.session_state.start_time = time.time()
+                st.rerun()
+
+
+# 4️⃣ Summary & Export
+with tabs[3]:
+    st.title("📊 Auction Summary & Export")
+
+    results_df = load_results_from_db()
+    teams_db = load_teams_from_db()
+
+    if results_df.empty:
+        st.warning("⚠️ No auction results yet.")
+    else:
+        st.subheader("🏁 Results")
+        st.dataframe(results_df)
+
+        # CSV download
+        csv_bytes = results_df.to_csv(index=False).encode('utf-8')
+        st.download_button("⬇️ Download Results CSV", csv_bytes, file_name="auction_results.csv")
+
+        # Excel export combining team sheets
+        excel_file = "auction_results.xlsx"
+        try:
+            export_results_to_excel(results_df, teams_db, filename=excel_file)
+            with open(excel_file, "rb") as f:
+                st.download_button("⬇️ Download Combined Excel", f.read(), file_name=excel_file)
+        except Exception as e:
+            st.error(f"Could not create Excel file: {e}")
+
+    # Unsold players export: build from players table
+    players_df = load_players_df_from_db()
+    if not players_df.empty:
+        unsold_df = players_df[players_df['auctioned'] == 1].copy()
+        # Find those marked UNSOLD in results
+        res_df = results_df
+        if not res_df.empty:
+            unsold_ids = res_df[res_df['team'] == "UNSOLD"]['player_id'].unique().tolist()
+            if unsold_ids:
+                unsold_players_df = players_df[players_df['player_id'].isin(unsold_ids)]
+                if not unsold_players_df.empty:
+                    st.markdown("---")
+                    st.subheader("🚫 Unsold Players")
+                    st.dataframe(unsold_players_df[['player_id', 'full_name', 'department', 'year', 'role']])
+                    # download button
+                    csv_u = unsold_players_df.to_csv(index=False).encode()
+                    st.download_button("⬇️ Download Unsold Players (CSV)", csv_u, file_name="unsold_players.csv")
+
+        
+
+    # Team wise details
+    st.markdown("---")
+    st.subheader("👥 Team Details")
+    teams_display = load_teams_from_db()
+    if not teams_display:
+        st.info("No teams configured yet.")
+    else:
+        for t in teams_display:
+            with st.expander(f"{t['Team']} (💰 Left: ₹{t['Budget']})"):
+                # get players for this team from results table
+                res = results_df[results_df['team'] == t['Team']] if not results_df.empty else pd.DataFrame()
+                if res.empty:
+                    st.info("No players bought yet.")
+                else:
+                    # merge with players table for details
+                    merged = res.merge(players_df, left_on='player_id', right_on='player_id', how='left',
+                                       suffixes=('_res', '_p'))
+                    # display names and prices
+                    for _, row in merged.iterrows():
+                        col1, col2 = st.columns([1, 3])
+                        with col1:
+                            show_player_image(row.get('photo'), caption=row.get('full_name'))
+                        with col2:
+                            st.markdown(f"**{row.get('full_name')}** — Role: {row.get('role')} | Year: {row.get('year')} | Price: ₹{row.get('price')}")
+
+# ------------- END --------------

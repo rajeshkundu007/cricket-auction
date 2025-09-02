@@ -224,42 +224,40 @@ def download_image_bytes(url: str):
     return r.content, r.headers.get("Content-Type", "")
 
 def show_player_image(photo_link, caption=""):
-    """Robust image display:
-       1) extract file id and try to download bytes and open via PIL (recommended)
-       2) if (1) fails, try st.image with the uc download url (embedding)
-       3) fallback to placeholder
-    """
+    """Display player image from local photos folder. Fallback to placeholder if not found."""
     placeholder_exists = os.path.exists(PLACEHOLDER)
-    fid = extract_drive_file_id(photo_link)
-    if fid:
-        url = make_drive_download_url(fid)
-        # try direct download + PIL display
+    # photo_link is not used anymore, we need player_id from context
+    # Expect photo_link to be player_id or dict with player_id
+    player_id = None
+    if isinstance(photo_link, dict):
+        player_id = photo_link.get('player_id')
+    elif isinstance(photo_link, int):
+        player_id = photo_link
+    elif isinstance(photo_link, str):
+        # Try to parse player_id from string
         try:
-            img_bytes, content_type = download_image_bytes(url)
+            player_id = int(photo_link)
+        except Exception:
+            player_id = None
+    # Build local photo path
+    img_path = None
+    if player_id is not None:
+        img_path = os.path.join("photos", f"photo_{player_id-1}.jpg")
+        abs_img_path = os.path.join(os.path.dirname(__file__), img_path)
+        if os.path.exists(abs_img_path):
             try:
-                img = Image.open(BytesIO(img_bytes))
+                img = Image.open(abs_img_path)
                 st.image(img, width=400, caption=caption)
                 return
-            except UnidentifiedImageError:
-                # not a valid image
+            except Exception:
                 pass
-        except Exception:
-            # download failed - maybe Drive requires confirm token for large files or file not available
-            pass
-        # fallback: try embedding the uc url (sometimes works)
-        try:
-            st.image(url, width=200, caption=caption)
-            return
-        except Exception:
-            pass
-
-    # If we reach here, nothing worked -> show placeholder
+    # Fallback to placeholder
     if placeholder_exists:
         st.image(PLACEHOLDER, width=200, caption=caption)
     else:
         st.write("(image not available)")
-        if caption:
-            st.caption(caption)
+    if caption:
+        st.caption(caption)
 
 # ----------------- SOUND -----------------
 def play_sound():
@@ -286,9 +284,10 @@ init_db()
 
 with st.sidebar:
     if st.button("🗑️ Reset Auction Summary"):
-        clear_results()
-        reset_summary_session()
-        st.success("✅ Auction summary cleared! Teams and players are intact.")
+        # Only clear auction results and summary session state, do NOT touch teams or players
+        clear_results()  # clears results table (affects results and unsold players in summary)
+        reset_summary_session()  # clears auction_results, current_player, start_time in session state
+        st.success("✅ Auction results and unsold players cleared from summary! Team details remain unchanged.")
         st.rerun()
 
 # Load persisted data into session_state on first run
@@ -396,11 +395,38 @@ with tabs[2]:
             player = st.session_state.current_player
             with col_left:
                 st.subheader("Player Photo")
-                st.image(
-                player.get("photo"),
-                
-                width=1000)  # ⬅️ Increase/decrease this number as needed)
-                show_player_image(player.get("photo"), caption=player.get("full_name"))
+
+                pid = player.get("player_id")
+                name = player.get("full_name", "")
+                img_path = None
+
+                # Try local photo
+                candidate = os.path.join("photos", f"photo_{max(int(pid)-1,0)}.jpg") if pid else None
+                if candidate and os.path.exists(candidate):
+                    img_path = candidate
+                elif os.path.exists(PLACEHOLDER):
+                    img_path = PLACEHOLDER
+
+                if img_path:
+                    try:
+                        with open(img_path, "rb") as f:
+                            img_bytes = f.read()
+                        mime = "image/jpeg" if img_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                        b64 = base64.b64encode(img_bytes).decode()
+                        img_div = (
+                            f'<div style="width:450px;height:450px;display:flex;align-items:center;justify-content:center;'
+                            f'background:black;overflow:hidden;margin:auto;">'
+                            f'<img src="data:{mime};base64,{b64}" '
+                            f'style="max-width:100%;max-height:100%;object-fit:contain;display:block;" '
+                            f'alt="{name}" />'
+                            f'</div>'
+                        )
+                    except Exception:
+                        img_div = '<div style="width:450px;height:450px;background:black;color:white;display:flex;align-items:center;justify-content:center;">(no image)</div>'
+                else:
+                    img_div = '<div style="width:450px;height:450px;background:black;color:white;display:flex;align-items:center;justify-content:center;">(no image)</div>'
+
+                st.markdown(img_div, unsafe_allow_html=True)
             with col_right:
                 st.subheader("🔥 Player on Auction")
                 st.markdown(f"<span style='font-size:2rem; font-weight:bold;'>Name: {player.get('full_name')}</span>", unsafe_allow_html=True)
@@ -499,12 +525,12 @@ with tabs[3]:
 
         
 
-    # Team wise details
+    # Team wise details (200x200 black frame with white text below)
     st.markdown("---")
     st.subheader("👥 Team Details")
     teams_display = load_teams_from_db()
+
     for t in teams_display:
-        # count players bought for this team
         res = results_df[results_df['team'] == t['Team']] if not results_df.empty else pd.DataFrame()
         bought_count = len(res)
         left_to_buy = max(13 - bought_count, 0)
@@ -513,44 +539,89 @@ with tabs[3]:
             if res.empty:
                 st.info("No players bought yet.")
             else:
-                # merge with players table for details
-                merged = res.merge(players_df, on='player_id', how='left', suffixes=('_res', '_p'))
+                res_local = res.copy()
+                if 'full_name' in res_local.columns:
+                    res_local = res_local.rename(columns={'full_name': 'full_name_res'})
 
-                # grid layout: 5 columns
+                players_subset = players_df[['player_id', 'full_name', 'department', 'year', 'role', 'photo']] if not players_df.empty else pd.DataFrame()
+                merged = res_local.merge(players_subset, on='player_id', how='left')
+
                 cols = st.columns(5)
                 for idx, row in merged.iterrows():
-                    col = cols[idx % 5]  # pick one of 5 columns
-                    with col:
-                        # show original size image (no width forced)
-                        try:
-                            fid = extract_drive_file_id(row.get("photo"))
-                            if fid:
-                                url = make_drive_download_url(fid)
-                                st.image(url, caption=None)
-                            else:
-                                if os.path.exists(PLACEHOLDER):
-                                    st.image(PLACEHOLDER)
-                                else:
-                                    st.write("(no image)")
-                        except Exception:
-                            if os.path.exists(PLACEHOLDER):
-                                st.image(PLACEHOLDER)
-                            else:
-                                st.write("(no image)")
+                    col = cols[idx % 5]
 
-                        # details below photo
-                        st.markdown(
-                            f"<div style='text-align:center; font-size:0.85rem;'>"
-                            f"<b>{row.get('full_name')}</b><br>"
-                            f"🆔 {row.get('player_id')}<br>"
-                            f"{row.get('role')} | {row.get('year')}<br>"
-                            f"₹{row.get('price')}"
-                            f"</div>",
-                            unsafe_allow_html=True
+                    # determine display name
+                    name = ''
+                    if 'full_name_res' in row and pd.notna(row['full_name_res']):
+                        name = row['full_name_res']
+                    elif 'full_name' in row and pd.notna(row['full_name']):
+                        name = row['full_name']
+
+                    with col:
+                        try:
+                            pid = int(row.get('player_id', 0))
+                        except Exception:
+                            pid = 0
+
+                        # choose image
+                        img_path = None
+                        photo_field = row.get('photo', None)
+                        if isinstance(photo_field, str) and photo_field.strip():
+                            if os.path.exists(photo_field):
+                                img_path = photo_field
+                            else:
+                                candidate = os.path.join("photos", photo_field)
+                                if os.path.exists(candidate):
+                                    img_path = candidate
+
+                        if img_path is None:
+                            candidate2 = os.path.join("photos", f"photo_{max(pid-1,0)}.jpg")
+                            if os.path.exists(candidate2):
+                                img_path = candidate2
+
+                        if img_path is None and os.path.exists(PLACEHOLDER):
+                            img_path = PLACEHOLDER
+
+                        # black frame 200x200
+                        if img_path:
+                            try:
+                                with open(img_path, "rb") as f:
+                                    img_bytes = f.read()
+                                mime = "image/jpeg" if img_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                                b64 = base64.b64encode(img_bytes).decode()
+                                img_div = (
+                                    f'<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;'
+                                    f'background:black;overflow:hidden;">'
+                                    f'<img src="data:{mime};base64,{b64}" '
+                                    f'style="max-width:100%;max-height:100%;object-fit:contain;display:block;" '
+                                    f'alt="{name}" />'
+                                    f'</div>'
+                                )
+                            except Exception:
+                                img_div = '<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;background:black;color:white;">(no image)</div>'
+                        else:
+                            img_div = '<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;background:black;color:white;">(no image)</div>'
+
+                        # white text details below
+                        details_div = (
+                            '<div style="padding:8px;text-align:center;font-size:0.85rem;line-height:1.3;background:black;color:white;">'
+                            f'<div style="font-weight:600;margin-bottom:4px;white-space:normal;">{name}</div>'
+                            f'<div style="font-size:0.8rem;">🆔 {pid} &nbsp;|&nbsp; {row.get("role","")} &nbsp;|&nbsp; {row.get("year","")}</div>'
+                            f'<div style="margin-top:6px;font-weight:700;">₹{row.get("price", 0)}</div>'
+                            '</div>'
                         )
 
-                    # after every 5 players, reset columns
+                        card_html = (
+                            '<div style="width:200px;border:1px solid #333;border-radius:10px;overflow:hidden;'
+                            'margin:8px auto;background:black;box-sizing:border-box;text-align:center;">'
+                            f'{img_div}'
+                            f'{details_div}'
+                            '</div>'
+                        )
+
+                        st.markdown(card_html, unsafe_allow_html=True)
+
                     if (idx + 1) % 5 == 0 and (idx + 1) < len(merged):
                         cols = st.columns(5)
 
-# ------------- END --------------
+    # ------------- END --------------

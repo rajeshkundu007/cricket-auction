@@ -358,7 +358,7 @@ with tabs[1]:
             default_name = existing_teams[i]['Team'] if i < len(existing_teams) else ""
             default_budget = existing_teams[i]['Budget'] if i < len(existing_teams) else 1000
             name = col1.text_input(f"Team {i+1} Name", value=default_name, key=f"team_name_{i}")
-            budget = col2.number_input(f"Budget (₹)", min_value=10, step=10, value=int(default_budget), key=f"budget_{i}")
+            budget = col2.number_input(f"Budget (₹)", min_value=0, step=10, value=int(default_budget), key=f"budget_{i}")
             teams_input.append({"Team": name.strip(), "Budget": int(budget), "InitialBudget": int(budget), "Spent": 0, "Players": []})
         submit = st.form_submit_button("✅ Save Teams")
 
@@ -407,6 +407,7 @@ with tabs[2]:
                 st.markdown(f"<span style='font-size:1.5rem;'>Role: {player.get('role')}</span>", unsafe_allow_html=True)
                 st.markdown(f"<span style='font-size:1.5rem;'>Dept: {player.get('department')}</span>", unsafe_allow_html=True)
                 st.markdown(f"<span style='font-size:1.5rem;'>Year: {player.get('year')}</span>", unsafe_allow_html=True)
+                st.markdown(f"<span style='font-size:1.5rem; color:#2E86C1;'>Player ID: {player.get('player_id')}</span>", unsafe_allow_html=True)
                 st.markdown("---")
                 teams_list = [t['Team'] for t in st.session_state.teams] if st.session_state.teams else []
                 bid_col1, bid_col2 = st.columns([2, 1])
@@ -502,25 +503,54 @@ with tabs[3]:
     st.markdown("---")
     st.subheader("👥 Team Details")
     teams_display = load_teams_from_db()
-    if not teams_display:
-        st.info("No teams configured yet.")
-    else:
-        for t in teams_display:
-            with st.expander(f"{t['Team']} (💰 Left: ₹{t['Budget']})"):
-                # get players for this team from results table
-                res = results_df[results_df['team'] == t['Team']] if not results_df.empty else pd.DataFrame()
-                if res.empty:
-                    st.info("No players bought yet.")
-                else:
-                    # merge with players table for details
-                    merged = res.merge(players_df, left_on='player_id', right_on='player_id', how='left',
-                                       suffixes=('_res', '_p'))
-                    # display names and prices
-                    for _, row in merged.iterrows():
-                        col1, col2 = st.columns([1, 3])
-                        with col1:
-                            show_player_image(row.get('photo'), caption=row.get('full_name'))
-                        with col2:
-                            st.markdown(f"**{row.get('full_name')}** — Role: {row.get('role')} | Year: {row.get('year')} | Price: ₹{row.get('price')}")
+    for t in teams_display:
+        # count players bought for this team
+        res = results_df[results_df['team'] == t['Team']] if not results_df.empty else pd.DataFrame()
+        bought_count = len(res)
+        left_to_buy = max(13 - bought_count, 0)
+
+        with st.expander(f"{t['Team']} (💰 Left: ₹{t['Budget']} | 🏏 Bought: {bought_count} | 🎯 Left to Buy: {left_to_buy})"):
+            if res.empty:
+                st.info("No players bought yet.")
+            else:
+                # merge with players table for details
+                merged = res.merge(players_df, on='player_id', how='left', suffixes=('_res', '_p'))
+
+                # grid layout: 5 columns
+                cols = st.columns(5)
+                for idx, row in merged.iterrows():
+                    col = cols[idx % 5]  # pick one of 5 columns
+                    with col:
+                        # show original size image (no width forced)
+                        try:
+                            fid = extract_drive_file_id(row.get("photo"))
+                            if fid:
+                                url = make_drive_download_url(fid)
+                                st.image(url, caption=None)
+                            else:
+                                if os.path.exists(PLACEHOLDER):
+                                    st.image(PLACEHOLDER)
+                                else:
+                                    st.write("(no image)")
+                        except Exception:
+                            if os.path.exists(PLACEHOLDER):
+                                st.image(PLACEHOLDER)
+                            else:
+                                st.write("(no image)")
+
+                        # details below photo
+                        st.markdown(
+                            f"<div style='text-align:center; font-size:0.85rem;'>"
+                            f"<b>{row.get('full_name')}</b><br>"
+                            f"🆔 {row.get('player_id')}<br>"
+                            f"{row.get('role')} | {row.get('year')}<br>"
+                            f"₹{row.get('price')}"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+
+                    # after every 5 players, reset columns
+                    if (idx + 1) % 5 == 0 and (idx + 1) < len(merged):
+                        cols = st.columns(5)
 
 # ------------- END --------------

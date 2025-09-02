@@ -457,17 +457,31 @@ with tabs[2]:
                     unsold_btn = st.button("❌ Mark as Unsold", key="unsold_btn")
 
                 if sold_btn and sold_price > 0:
-                    # commit to DB
-                    add_result_to_db(int(player['player_id']), player['full_name'], selected_team, int(sold_price))
-                    # update session_state players_df
-                    st.session_state.players_df = load_players_df_from_db()
-                    # update teams in session from DB
-                    st.session_state.teams = load_teams_from_db()
-                    st.session_state.current_player = None
-                    st.session_state.start_time = None
-                    st.success(f"🎉 {player['full_name']} sold to {selected_team} for ₹{sold_price}!")
-                    play_sound()
-                    st.rerun()
+                    if selected_team == "Select Team":
+                        st.error("⚠️ Please select a team before selling.")
+                    else:
+                        # Get the team's current budget
+                        team_row = next((t for t in st.session_state.teams if t['Team'] == selected_team), None)
+                        if team_row:
+                            current_budget = team_row['Budget']
+
+                            if sold_price > current_budget:
+                                # 🚨 Block sale and show warning popup
+                                st.error(f"🚨 {selected_team} does not have enough budget! "
+                                         f"Remaining: ₹{current_budget}, Tried: ₹{sold_price}")
+                            else:
+                                # ✅ Commit sale to DB
+                                add_result_to_db(int(player['player_id']), player['full_name'],
+                                                 selected_team, int(sold_price))
+                                # update session_state players_df
+                                st.session_state.players_df = load_players_df_from_db()
+                                # update teams in session from DB
+                                st.session_state.teams = load_teams_from_db()
+                                st.session_state.current_player = None
+                                st.session_state.start_time = None
+                                st.success(f"🎉 {player['full_name']} sold to {selected_team} for ₹{sold_price}!")
+                                play_sound()
+                                st.rerun()
 
                 if unsold_btn:
                     add_result_to_db(int(player['player_id']), player['full_name'], "UNSOLD", 0)
@@ -478,10 +492,42 @@ with tabs[2]:
                     st.rerun()
 
 
-        # Pick random player button
-        # 🔹 FIX: Use unique random picker instead of raw sample
+        # 🔹 Sold button fix with strict budget check
+        if st.button("✅ Sold"):
+            player_id = st.session_state.current_player["player_id"]
+            team_name = st.session_state.current_player.get("selected_team")
+            bid_price = st.session_state.current_player.get("bid_price", 0)
+
+            if team_name is None:
+                st.error("⚠️ Please select a team before selling.")
+            else:
+                team_budget = st.session_state.teams.loc[
+                    st.session_state.teams["team_name"] == team_name, "budget"
+                ].values[0]
+
+                # 🚨 Block sale if budget insufficient
+                if bid_price > team_budget:
+                    st.error("🚨 INSUFFICIENT FUND: CANT AFFORD PLAYER AT THIS PRICE")
+                else:
+                    # Deduct safely without negatives
+                    new_budget = team_budget - bid_price
+                    st.session_state.teams.loc[
+                        st.session_state.teams["team_name"] == team_name, "budget"
+                    ] = new_budget
+
+                    add_result_to_db(player_id, team_name, bid_price, status="Sold")
+                    st.session_state.current_player = None
+                    st.rerun()
+
+        if st.button("❌ Unsold"):
+            player_id = st.session_state.current_player["player_id"]
+            add_result_to_db(player_id, None, 0, status="Unsold")
+            st.session_state.current_player = None
+            st.rerun()
+
+        # 🔹 Pick Random Player (disabled until resolved)
         st.markdown("---")
-        pick_disabled = st.session_state.current_player is not None  # disable if player active
+        pick_disabled = st.session_state.current_player is not None
         if st.button("🎲 Pick Random Player", disabled=pick_disabled):
             picked = pick_unique_random_player()
             if picked is None:
@@ -490,21 +536,6 @@ with tabs[2]:
                 st.session_state.current_player = picked
                 st.session_state.start_time = time.time()
                 st.rerun()
-        # 🔹 FIX: Ensure Sold/Unsold clears current player
-        if st.session_state.current_player is not None:
-            player_id = st.session_state.current_player["player_id"]
-
-
-            if st.button("✅ Sold"):
-                add_result_to_db(player_id, team, price, status="Sold")
-                st.session_state.current_player = None
-                st.rerun()
-
-
-            if st.button("❌ Unsold"):
-                add_result_to_db(player_id, None, 0, status="Unsold")
-                st.session_state.current_player = None
-                st.rerun() 
 
 # 4️⃣ Summary & Export
 with tabs[3]:

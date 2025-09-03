@@ -604,82 +604,86 @@ with tabs[3]:
                 players_subset = players_df[['player_id', 'full_name', 'department', 'year', 'role', 'photo']] if not players_df.empty else pd.DataFrame()
                 merged = res_local.merge(players_subset, on='player_id', how='left')
 
-                cols = st.columns(5)
-                for idx, row in merged.iterrows():
-                    col = cols[idx % 5]
+                # ---- 5x4 Grid Layout ----
+                max_cols = 5
+                max_rows = 4
+                cards_per_page = max_cols * max_rows
 
-                    # determine display name
-                    name = ''
-                    if 'full_name_res' in row and pd.notna(row['full_name_res']):
-                        name = row['full_name_res']
-                    elif 'full_name' in row and pd.notna(row['full_name']):
-                        name = row['full_name']
+                for page_start in range(0, len(merged), cards_per_page):
+                    page_df = merged.iloc[page_start: page_start + cards_per_page]
 
-                    with col:
-                        try:
-                            pid = int(row.get('player_id', 0))
-                        except Exception:
-                            pid = 0
+                    for row_start in range(0, len(page_df), max_cols):
+                        row_df = page_df.iloc[row_start: row_start + max_cols]
+                        cols = st.columns(max_cols)
 
-                        # choose image
-                        img_path = None
-                        photo_field = row.get('photo', None)
-                        if isinstance(photo_field, str) and photo_field.strip():
-                            if os.path.exists(photo_field):
-                                img_path = photo_field
+                        for idx, row in enumerate(row_df.itertuples()):
+                            col = cols[idx]
+
+                            # determine display name
+                            name = ''
+                            if hasattr(row, 'full_name_res') and pd.notna(row.full_name_res):
+                                name = row.full_name_res
+                            elif hasattr(row, 'full_name') and pd.notna(row.full_name):
+                                name = row.full_name
+
+                            pid = int(getattr(row, 'player_id', 0) or 0)
+
+                            # choose image
+                            img_path = None
+                            photo_field = getattr(row, 'photo', None)
+                            if isinstance(photo_field, str) and photo_field.strip():
+                                if os.path.exists(photo_field):
+                                    img_path = photo_field
+                                else:
+                                    candidate = os.path.join("photos", photo_field)
+                                    if os.path.exists(candidate):
+                                        img_path = candidate
+
+                            if img_path is None:
+                                candidate2 = os.path.join("photos", f"photo_{max(pid-1,0)}.jpg")
+                                if os.path.exists(candidate2):
+                                    img_path = candidate2
+
+                            if img_path is None and os.path.exists(PLACEHOLDER):
+                                img_path = PLACEHOLDER
+
+                            # black frame 200x200
+                            if img_path:
+                                try:
+                                    with open(img_path, "rb") as f:
+                                        img_bytes = f.read()
+                                    mime = "image/jpeg" if img_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                                    b64 = base64.b64encode(img_bytes).decode()
+                                    img_div = (
+                                        f'<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;'
+                                        f'background:black;overflow:hidden;">'
+                                        f'<img src="data:{mime};base64,{b64}" '
+                                        f'style="max-width:100%;max-height:100%;object-fit:contain;display:block;" '
+                                        f'alt="{name}" />'
+                                        f'</div>'
+                                    )
+                                except Exception:
+                                    img_div = '<div style="width:200px;height:200px;background:black;color:white;display:flex;align-items:center;justify-content:center;">(no image)</div>'
                             else:
-                                candidate = os.path.join("photos", photo_field)
-                                if os.path.exists(candidate):
-                                    img_path = candidate
+                                img_div = '<div style="width:200px;height:200px;background:black;color:white;display:flex;align-items:center;justify-content:center;">(no image)</div>'
 
-                        if img_path is None:
-                            candidate2 = os.path.join("photos", f"photo_{max(pid-1,0)}.jpg")
-                            if os.path.exists(candidate2):
-                                img_path = candidate2
+                            # white text details below
+                            details_div = (
+                                '<div style="padding:8px;text-align:center;font-size:0.85rem;line-height:1.3;background:black;color:white;">'
+                                f'<div style="font-weight:600;margin-bottom:4px;white-space:normal;">{name}</div>'
+                                f'<div style="font-size:0.8rem;">🆔 {pid} &nbsp;|&nbsp; {getattr(row, "role","")} &nbsp;|&nbsp; {getattr(row,"year","")}</div>'
+                                f'<div style="margin-top:6px;font-weight:700;">₹{getattr(row, "price", 0)}</div>'
+                                '</div>'
+                            )
 
-                        if img_path is None and os.path.exists(PLACEHOLDER):
-                            img_path = PLACEHOLDER
+                            card_html = (
+                                '<div style="width:200px;border:1px solid #333;border-radius:10px;overflow:hidden;'
+                                'margin:8px auto;background:black;box-sizing:border-box;text-align:center;">'
+                                f'{img_div}'
+                                f'{details_div}'
+                                '</div>'
+                            )
 
-                        # black frame 200x200
-                        if img_path:
-                            try:
-                                with open(img_path, "rb") as f:
-                                    img_bytes = f.read()
-                                mime = "image/jpeg" if img_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
-                                b64 = base64.b64encode(img_bytes).decode()
-                                img_div = (
-                                    f'<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;'
-                                    f'background:black;overflow:hidden;">'
-                                    f'<img src="data:{mime};base64,{b64}" '
-                                    f'style="max-width:100%;max-height:100%;object-fit:contain;display:block;" '
-                                    f'alt="{name}" />'
-                                    f'</div>'
-                                )
-                            except Exception:
-                                img_div = '<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;background:black;color:white;">(no image)</div>'
-                        else:
-                            img_div = '<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;background:black;color:white;">(no image)</div>'
-
-                        # white text details below
-                        details_div = (
-                            '<div style="padding:8px;text-align:center;font-size:0.85rem;line-height:1.3;background:black;color:white;">'
-                            f'<div style="font-weight:600;margin-bottom:4px;white-space:normal;">{name}</div>'
-                            f'<div style="font-size:0.8rem;">🆔 {pid} &nbsp;|&nbsp; {row.get("role","")} &nbsp;|&nbsp; {row.get("year","")}</div>'
-                            f'<div style="margin-top:6px;font-weight:700;">₹{row.get("price", 0)}</div>'
-                            '</div>'
-                        )
-
-                        card_html = (
-                            '<div style="width:200px;border:1px solid #333;border-radius:10px;overflow:hidden;'
-                            'margin:8px auto;background:black;box-sizing:border-box;text-align:center;">'
-                            f'{img_div}'
-                            f'{details_div}'
-                            '</div>'
-                        )
-
-                        st.markdown(card_html, unsafe_allow_html=True)
-
-                    if (idx + 1) % 5 == 0 and (idx + 1) < len(merged):
-                        cols = st.columns(5)
+                            col.markdown(card_html, unsafe_allow_html=True)
 
     # ------------- END --------------

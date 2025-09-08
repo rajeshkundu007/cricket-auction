@@ -1,0 +1,7 @@
+# hide files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.db
+*.xlsx

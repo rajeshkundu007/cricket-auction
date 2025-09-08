@@ -9,6 +9,7 @@ import requests
 import base64
 from io import BytesIO
 from PIL import Image, UnidentifiedImageError
+import random
 
 # ----------------- CONFIG -----------------
 DB_FILE = "auction.db"
@@ -16,7 +17,7 @@ PLACEHOLDER = "assets/placeholder.png"
 BELL = "assets/bell.mp3"
 
 st.set_page_config(page_title="🏏 Cricket Auction App (DB)", layout="wide")
-st.sidebar.markdown("[🌐 GitHub](https://github.com/deveshc20)  |  🧑‍💻 Created by **DC**")
+
 
 # ----------------- DATABASE HELPERS -----------------
 def init_db():
@@ -224,42 +225,40 @@ def download_image_bytes(url: str):
     return r.content, r.headers.get("Content-Type", "")
 
 def show_player_image(photo_link, caption=""):
-    """Robust image display:
-       1) extract file id and try to download bytes and open via PIL (recommended)
-       2) if (1) fails, try st.image with the uc download url (embedding)
-       3) fallback to placeholder
-    """
+    """Display player image from local photos folder. Fallback to placeholder if not found."""
     placeholder_exists = os.path.exists(PLACEHOLDER)
-    fid = extract_drive_file_id(photo_link)
-    if fid:
-        url = make_drive_download_url(fid)
-        # try direct download + PIL display
+    # photo_link is not used anymore, we need player_id from context
+    # Expect photo_link to be player_id or dict with player_id
+    player_id = None
+    if isinstance(photo_link, dict):
+        player_id = photo_link.get('player_id')
+    elif isinstance(photo_link, int):
+        player_id = photo_link
+    elif isinstance(photo_link, str):
+        # Try to parse player_id from string
         try:
-            img_bytes, content_type = download_image_bytes(url)
+            player_id = int(photo_link)
+        except Exception:
+            player_id = None
+    # Build local photo path
+    img_path = None
+    if player_id is not None:
+        img_path = os.path.join("photos", f"photo_{player_id-1}.jpg")
+        abs_img_path = os.path.join(os.path.dirname(__file__), img_path)
+        if os.path.exists(abs_img_path):
             try:
-                img = Image.open(BytesIO(img_bytes))
+                img = Image.open(abs_img_path)
                 st.image(img, width=400, caption=caption)
                 return
-            except UnidentifiedImageError:
-                # not a valid image
+            except Exception:
                 pass
-        except Exception:
-            # download failed - maybe Drive requires confirm token for large files or file not available
-            pass
-        # fallback: try embedding the uc url (sometimes works)
-        try:
-            st.image(url, width=200, caption=caption)
-            return
-        except Exception:
-            pass
-
-    # If we reach here, nothing worked -> show placeholder
+    # Fallback to placeholder
     if placeholder_exists:
         st.image(PLACEHOLDER, width=200, caption=caption)
     else:
         st.write("(image not available)")
-        if caption:
-            st.caption(caption)
+    if caption:
+        st.caption(caption)
 
 # ----------------- SOUND -----------------
 def play_sound():
@@ -283,12 +282,15 @@ def play_sound():
 
 # ----------------- APP INIT -----------------
 init_db()
+if "auctioned_ids" not in st.session_state:
+    st.session_state.auctioned_ids = set()
 
 with st.sidebar:
     if st.button("🗑️ Reset Auction Summary"):
         clear_results()
         reset_summary_session()
-        st.success("✅ Auction summary cleared! Teams and players are intact.")
+        st.session_state.auctioned_ids.clear()  # 🔹 FIX: reset tracker too
+        st.success("✅ Auction results and unsold players cleared from summary! Team details remain unchanged.")
         st.rerun()
 
 # Load persisted data into session_state on first run
@@ -301,16 +303,25 @@ if "db_loaded" not in st.session_state:
     st.session_state.start_time = None
     st.session_state.db_loaded = True
 
-if "db_loaded" not in st.session_state:
-    st.session_state.players_df = load_players_df_from_db()
-    st.session_state.teams = load_teams_from_db()
-    st.session_state.auction_results = (
-        load_results_from_db().to_dict(orient="records")
-        if not load_results_from_db().empty else []
-    )
-    st.session_state.current_player = None
-    st.session_state.start_time = None
-    st.session_state.db_loaded = True
+# ----------------- FIX: Unique random player picker -----------------
+def pick_unique_random_player():
+    """Pick a random unauctioned player not seen before."""
+    fresh_players = load_players_df_from_db()
+    unauctioned_df = fresh_players[fresh_players['auctioned'] == 0]
+
+    # ✅ FIX: Only filter by auctioned flag, not session tracker if DB is fresh
+    if unauctioned_df.empty:
+        return None
+
+    # Exclude players already chosen in this session (extra safeguard)
+    unauctioned_df = unauctioned_df[~unauctioned_df['player_id'].isin(st.session_state.auctioned_ids)]
+
+    if unauctioned_df.empty:
+        return None
+
+    picked = unauctioned_df.sample(1).iloc[0].to_dict()
+    st.session_state.auctioned_ids.add(picked['player_id'])  # track this ID
+    return picked
 
 # ----------------- UI: Tabs -----------------
 tabs = st.tabs(["📅 Upload Players", "👥 Team Setup", "🎯 Auction Panel", "📊 Summary & Export"])
@@ -358,7 +369,7 @@ with tabs[1]:
             default_name = existing_teams[i]['Team'] if i < len(existing_teams) else ""
             default_budget = existing_teams[i]['Budget'] if i < len(existing_teams) else 1000
             name = col1.text_input(f"Team {i+1} Name", value=default_name, key=f"team_name_{i}")
-            budget = col2.number_input(f"Budget (₹)", min_value=10, step=10, value=int(default_budget), key=f"budget_{i}")
+            budget = col2.number_input(f"Budget (₹)", min_value=0, step=10, value=int(default_budget), key=f"budget_{i}")
             teams_input.append({"Team": name.strip(), "Budget": int(budget), "InitialBudget": int(budget), "Spent": 0, "Players": []})
         submit = st.form_submit_button("✅ Save Teams")
 
@@ -396,39 +407,81 @@ with tabs[2]:
             player = st.session_state.current_player
             with col_left:
                 st.subheader("Player Photo")
-                st.image(
-                player.get("photo"),
-                
-                width=1000)  # ⬅️ Increase/decrease this number as needed)
-                show_player_image(player.get("photo"), caption=player.get("full_name"))
+
+                pid = player.get("player_id")
+                name = player.get("full_name", "")
+                img_path = None
+
+                # Try local photo
+                candidate = os.path.join("photos", f"photo_{max(int(pid)-1,0)}.jpg") if pid else None
+                if candidate and os.path.exists(candidate):
+                    img_path = candidate
+                elif os.path.exists(PLACEHOLDER):
+                    img_path = PLACEHOLDER
+
+                if img_path:
+                    try:
+                        with open(img_path, "rb") as f:
+                            img_bytes = f.read()
+                        mime = "image/jpeg" if img_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                        b64 = base64.b64encode(img_bytes).decode()
+                        img_div = (
+                            f'<div style="width:450px;height:450px;display:flex;align-items:center;justify-content:center;'
+                            f'background:black;overflow:hidden;margin:auto;">'
+                            f'<img src="data:{mime};base64,{b64}" '
+                            f'style="max-width:100%;max-height:100%;object-fit:contain;display:block;" '
+                            f'alt="{name}" />'
+                            f'</div>'
+                        )
+                    except Exception:
+                        img_div = '<div style="width:450px;height:450px;background:black;color:white;display:flex;align-items:center;justify-content:center;">(no image)</div>'
+                else:
+                    img_div = '<div style="width:450px;height:450px;background:black;color:white;display:flex;align-items:center;justify-content:center;">(no image)</div>'
+
+                st.markdown(img_div, unsafe_allow_html=True)
             with col_right:
                 st.subheader("🔥 Player on Auction")
                 st.markdown(f"<span style='font-size:2rem; font-weight:bold;'>Name: {player.get('full_name')}</span>", unsafe_allow_html=True)
                 st.markdown(f"<span style='font-size:1.5rem;'>Role: {player.get('role')}</span>", unsafe_allow_html=True)
                 st.markdown(f"<span style='font-size:1.5rem;'>Dept: {player.get('department')}</span>", unsafe_allow_html=True)
                 st.markdown(f"<span style='font-size:1.5rem;'>Year: {player.get('year')}</span>", unsafe_allow_html=True)
+                st.markdown(f"<span style='font-size:1.5rem; color:#2E86C1;'>Player ID: {player.get('player_id')}</span>", unsafe_allow_html=True)
                 st.markdown("---")
                 teams_list = [t['Team'] for t in st.session_state.teams] if st.session_state.teams else []
                 bid_col1, bid_col2 = st.columns([2, 1])
                 with bid_col1:
-                    selected_team = st.selectbox("🏷️ Select Team", ["UNSOLD"] + teams_list)
+                    selected_team = st.selectbox("🏷️ Select Team", ["Select Team"] + teams_list)
                     sold_price = st.number_input("💰 Sold Price (₹)", min_value=0, step=5, value=20)
                 with bid_col2:
                     sold_btn = st.button("✅ Mark as Sold", key="sold_btn")
                     unsold_btn = st.button("❌ Mark as Unsold", key="unsold_btn")
 
                 if sold_btn and sold_price > 0:
-                    # commit to DB
-                    add_result_to_db(int(player['player_id']), player['full_name'], selected_team, int(sold_price))
-                    # update session_state players_df
-                    st.session_state.players_df = load_players_df_from_db()
-                    # update teams in session from DB
-                    st.session_state.teams = load_teams_from_db()
-                    st.session_state.current_player = None
-                    st.session_state.start_time = None
-                    st.success(f"🎉 {player['full_name']} sold to {selected_team} for ₹{sold_price}!")
-                    play_sound()
-                    st.rerun()
+                    if selected_team == "Select Team":
+                        st.error("⚠️ Please select a team before selling.")
+                    else:
+                        # Get the team's current budget
+                        team_row = next((t for t in st.session_state.teams if t['Team'] == selected_team), None)
+                        if team_row:
+                            current_budget = team_row['Budget']
+
+                            if sold_price > current_budget:
+                                # 🚨 Block sale and show warning popup
+                                st.error(f"🚨 {selected_team} does not have enough budget! "
+                                         f"Remaining: ₹{current_budget}, Tried: ₹{sold_price}")
+                            else:
+                                # ✅ Commit sale to DB
+                                add_result_to_db(int(player['player_id']), player['full_name'],
+                                                 selected_team, int(sold_price))
+                                # update session_state players_df
+                                st.session_state.players_df = load_players_df_from_db()
+                                # update teams in session from DB
+                                st.session_state.teams = load_teams_from_db()
+                                st.session_state.current_player = None
+                                st.session_state.start_time = None
+                                st.success(f"🎉 {player['full_name']} sold to {selected_team} for ₹{sold_price}!")
+                                play_sound()
+                                st.rerun()
 
                 if unsold_btn:
                     add_result_to_db(int(player['player_id']), player['full_name'], "UNSOLD", 0)
@@ -439,18 +492,50 @@ with tabs[2]:
                     st.rerun()
 
 
-        # Pick random player button
+        # 🔹 Sold button fix with strict budget check
+        if st.button("✅ Sold"):
+            player_id = st.session_state.current_player["player_id"]
+            team_name = st.session_state.current_player.get("selected_team")
+            bid_price = st.session_state.current_player.get("bid_price", 0)
+
+            if team_name is None:
+                st.error("⚠️ Please select a team before selling.")
+            else:
+                team_budget = st.session_state.teams.loc[
+                    st.session_state.teams["team_name"] == team_name, "budget"
+                ].values[0]
+
+                # 🚨 Block sale if budget insufficient
+                if bid_price > team_budget:
+                    st.error("🚨 INSUFFICIENT FUND: CANT AFFORD PLAYER AT THIS PRICE")
+                else:
+                    # Deduct safely without negatives
+                    new_budget = team_budget - bid_price
+                    st.session_state.teams.loc[
+                        st.session_state.teams["team_name"] == team_name, "budget"
+                    ] = new_budget
+
+                    add_result_to_db(player_id, team_name, bid_price, status="Sold")
+                    st.session_state.current_player = None
+                    st.rerun()
+
+        if st.button("❌ Unsold"):
+            player_id = st.session_state.current_player["player_id"]
+            add_result_to_db(player_id, None, 0, status="Unsold")
+            st.session_state.current_player = None
+            st.rerun()
+
+        # 🔹 Pick Random Player (disabled until resolved)
         st.markdown("---")
-        if st.button("🎲 Pick Random Player"):
-            if unauctioned_df.empty:
+        pick_disabled = st.session_state.current_player is not None
+        if st.button("🎲 Pick Random Player", disabled=pick_disabled):
+            picked = pick_unique_random_player()
+            if picked is None:
                 st.info("✅ All players have been auctioned.")
             else:
-                # pick one and store in session
-                picked = unauctioned_df.sample(1).iloc[0].to_dict()
                 st.session_state.current_player = picked
                 st.session_state.start_time = time.time()
                 st.rerun()
-
 
 # 4️⃣ Summary & Export
 with tabs[3]:
@@ -498,29 +583,107 @@ with tabs[3]:
 
         
 
-    # Team wise details
+    # Team wise details (200x200 black frame with white text below)
     st.markdown("---")
     st.subheader("👥 Team Details")
     teams_display = load_teams_from_db()
-    if not teams_display:
-        st.info("No teams configured yet.")
-    else:
-        for t in teams_display:
-            with st.expander(f"{t['Team']} (💰 Left: ₹{t['Budget']})"):
-                # get players for this team from results table
-                res = results_df[results_df['team'] == t['Team']] if not results_df.empty else pd.DataFrame()
-                if res.empty:
-                    st.info("No players bought yet.")
-                else:
-                    # merge with players table for details
-                    merged = res.merge(players_df, left_on='player_id', right_on='player_id', how='left',
-                                       suffixes=('_res', '_p'))
-                    # display names and prices
-                    for _, row in merged.iterrows():
-                        col1, col2 = st.columns([1, 3])
-                        with col1:
-                            show_player_image(row.get('photo'), caption=row.get('full_name'))
-                        with col2:
-                            st.markdown(f"**{row.get('full_name')}** — Role: {row.get('role')} | Year: {row.get('year')} | Price: ₹{row.get('price')}")
 
-# ------------- END --------------
+    for t in teams_display:
+        res = results_df[results_df['team'] == t['Team']] if not results_df.empty else pd.DataFrame()
+        bought_count = len(res)
+        left_to_buy = max(13 - bought_count, 0)
+
+        with st.expander(f"{t['Team']} (💰 Left: ₹{t['Budget']} | 🏏 Bought: {bought_count} | 🎯 Left to Buy: {left_to_buy})"):
+            if res.empty:
+                st.info("No players bought yet.")
+            else:
+                res_local = res.copy()
+                if 'full_name' in res_local.columns:
+                    res_local = res_local.rename(columns={'full_name': 'full_name_res'})
+
+                players_subset = players_df[['player_id', 'full_name', 'department', 'year', 'role', 'photo']] if not players_df.empty else pd.DataFrame()
+                merged = res_local.merge(players_subset, on='player_id', how='left')
+
+                # ---- 5x4 Grid Layout ----
+                max_cols = 5
+                max_rows = 4
+                cards_per_page = max_cols * max_rows
+
+                for page_start in range(0, len(merged), cards_per_page):
+                    page_df = merged.iloc[page_start: page_start + cards_per_page]
+
+                    for row_start in range(0, len(page_df), max_cols):
+                        row_df = page_df.iloc[row_start: row_start + max_cols]
+                        cols = st.columns(max_cols)
+
+                        for idx, row in enumerate(row_df.itertuples()):
+                            col = cols[idx]
+
+                            # determine display name
+                            name = ''
+                            if hasattr(row, 'full_name_res') and pd.notna(row.full_name_res):
+                                name = row.full_name_res
+                            elif hasattr(row, 'full_name') and pd.notna(row.full_name):
+                                name = row.full_name
+
+                            pid = int(getattr(row, 'player_id', 0) or 0)
+
+                            # choose image
+                            img_path = None
+                            photo_field = getattr(row, 'photo', None)
+                            if isinstance(photo_field, str) and photo_field.strip():
+                                if os.path.exists(photo_field):
+                                    img_path = photo_field
+                                else:
+                                    candidate = os.path.join("photos", photo_field)
+                                    if os.path.exists(candidate):
+                                        img_path = candidate
+
+                            if img_path is None:
+                                candidate2 = os.path.join("photos", f"photo_{max(pid-1,0)}.jpg")
+                                if os.path.exists(candidate2):
+                                    img_path = candidate2
+
+                            if img_path is None and os.path.exists(PLACEHOLDER):
+                                img_path = PLACEHOLDER
+
+                            # black frame 200x200
+                            if img_path:
+                                try:
+                                    with open(img_path, "rb") as f:
+                                        img_bytes = f.read()
+                                    mime = "image/jpeg" if img_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                                    b64 = base64.b64encode(img_bytes).decode()
+                                    img_div = (
+                                        f'<div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;'
+                                        f'background:black;overflow:hidden;">'
+                                        f'<img src="data:{mime};base64,{b64}" '
+                                        f'style="max-width:100%;max-height:100%;object-fit:contain;display:block;" '
+                                        f'alt="{name}" />'
+                                        f'</div>'
+                                    )
+                                except Exception:
+                                    img_div = '<div style="width:200px;height:200px;background:black;color:white;display:flex;align-items:center;justify-content:center;">(no image)</div>'
+                            else:
+                                img_div = '<div style="width:200px;height:200px;background:black;color:white;display:flex;align-items:center;justify-content:center;">(no image)</div>'
+
+                            # white text details below
+                            details_div = (
+                                '<div style="padding:8px;text-align:center;font-size:0.85rem;line-height:1.3;background:black;color:white;">'
+                                f'<div style="font-weight:600;margin-bottom:4px;white-space:normal;">{name}</div>'
+                                f'<div style="font-size:0.8rem;">🆔 {pid} &nbsp;|&nbsp; {getattr(row, "role","")} &nbsp;|&nbsp; {getattr(row,"year","")}</div>'
+                                f'<div style="margin-top:6px;font-weight:700;">₹{getattr(row, "price", 0)}</div>'
+                                '</div>'
+                            )
+
+                            card_html = (
+                                '<div style="width:200px;border:1px solid #333;border-radius:10px;overflow:hidden;'
+                                'margin:8px auto;background:black;box-sizing:border-box;text-align:center;">'
+                                f'{img_div}'
+                                f'{details_div}'
+                                '</div>'
+                            )
+
+                            col.markdown(card_html, unsafe_allow_html=True)
+
+    # ------------- END --------------
